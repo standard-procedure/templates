@@ -1,0 +1,246 @@
+#!/usr/bin/env ruby
+require "fileutils"
+require "net/http"
+require "active_support/core_ext/string/inflections"
+
+name = ARGV[0]
+module_name = name.camelize
+c8o_name = "c8o_#{name}"
+
+output = `ruby -v`
+matches = output.match /ruby (\d.\d.\d) .*/
+ruby_version = matches[1]
+
+puts "Building plugin #{name} (#{module_name}) in #{c8o_name} using ruby #{ruby_version}"
+cmd = "rails plugin new #{name} --database=sqlite3 --asset-pipeline=propshaft --javascript=importmap --skip-bundle --full --dummy-path=spec/test_app"
+puts cmd
+system cmd
+puts "Renaming to #{c8o_name}"
+FileUtils.mv name, c8o_name
+FileUtils.cd c8o_name
+File.write "lib/#{c8o_name}.rb", "require_relative \"#{name}\""
+
+puts "Preparing #{c8o_name}"
+File.open(".gitignore", "a") { |f| f << ".DS_Store" }
+File.write("LICENCE", Net::HTTP.get(URI("https://www.gnu.org/licenses/lgpl-3.0.txt")))
+FileUtils.rm "MIT-LICENSE" if File.exist? "MIT-LICENCE"
+FileUtils.rm ".rubocop.yml" if File.exist? ".rubocop.yml"
+devcontainer = <<~JSON
+{
+  "image": "ghcr.io/rails/devcontainer/images/ruby:#{ruby_version}",
+  "features": {
+    "ghcr.io/rails/devcontainer/features/activestorage": {}
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "Shopify.ruby-extensions-pack",
+        "testdouble.vscode-standard-ruby",
+        "manuelpuyol.erb-linter",
+        "Shopify.ruby-lsp",
+        "aki77.rails-db-schema",
+        "miguel-savignano.ruby-symbols",
+        "sibiraj-s.vscode-scss-formatter",
+        "Thadeu.vscode-run-rspec-file",
+        "Cronos87.yaml-symbols"
+      ]
+    }
+  }}
+JSON
+File.write ".devcontainer.json", devcontainer
+
+standard_yml = <<~YML
+fix: true
+parallel: true
+format: progress
+default_ignores: true
+ignore:
+  - 'vendor/**/*'
+  - 'Gemfile.lock'
+YML
+File.write ".standard.yml", standard_yml
+
+ci_yaml = <<~YAML
+name: "CI"
+on:
+  push:
+    branches:
+      - main
+      - develop
+  pull_request:
+    branches:
+      - main
+jobs:
+  specs:
+    strategy:
+      fail-fast: true
+      matrix:
+        os: [ubuntu-latest]
+        # Due to https://github.com/actions/runner/issues/849, we have to use quotes for '3.0'
+        ruby: ['3.2', '3.3']
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: ${{ matrix.ruby }}
+          bundler-cache: true
+      - run: bin/rails db:create db:migrate db:test:prepare spec
+YAML
+File.write ".github/workflows/ci.yml", ci_yaml
+
+engine = <<~ENGINE
+module #{module_name}
+  class Engine < ::Rails::Engine
+    isolate_namespace #{module_name}
+
+    config.generators do |g|
+      g.test_framework :rspec
+      g.assets false
+      g.helper false
+    end
+  end
+end
+ENGINE
+File.write "lib/#{name}/engine.rb", engine
+
+puts "Updating gems"
+gemfile = <<~GEMFILE
+source "https://rubygems.org"
+
+gemspec
+
+gem "puma"
+gem "sqlite3"
+gem "propshaft"
+gem "rspec-rails"
+gem "ruby-lsp"
+gem "standard", ">= 1.3"
+gem "timecop"
+gem "guard"
+gem "guard-rspec"
+gem "guard-bundler"
+gem "guard-standardrb"
+GEMFILE
+File.write "Gemfile", gemfile
+
+gemspec = <<~GEMSPEC
+require_relative "lib/#{name}/version"
+Gem::Specification.new do |spec|
+  spec.name        = "c8o_my_engine"
+  spec.version     = #{module_name}::VERSION
+  spec.authors     = [ "Rahoul Baruah" ]
+  spec.email       = [ "baz@collabor8online.co.uk" ]
+  spec.homepage    = "https://www.collabor8online.co.uk/"
+  spec.summary     = "Collabor8Online #{module_name}"
+  spec.description = "#{module_name} for C8O"
+  spec.license     = "LGPL"
+
+  spec.metadata["allowed_push_host"] = "https://gems.c8online.com"
+
+  spec.metadata["homepage_uri"] = spec.homepage
+  spec.metadata["source_code_uri"] = "https://github.com/collabor8online"
+  spec.metadata["changelog_uri"] = "https://github.com/collabor8online"
+
+  spec.files = Dir.chdir(File.expand_path(__dir__)) do
+    Dir["{app,config,db,lib}/**/*", "LICENSE", "Rakefile", "README.md"]
+  end
+
+  spec.add_dependency "rails", ">= 7.1.3"
+end
+GEMSPEC
+File.write "#{name}.gemspec", gemspec
+
+puts "Installing gems"
+cmd = "bundle install"
+puts cmd
+system cmd
+
+puts "Preparing Guard"
+guardfile = <<~GUARDFILE
+group :development do
+  guard :rspec, cmd: "bundle exec rspec" do
+    watch(%r{^spec/.+_spec\.rb$})
+    watch(%r{^lib/(.+)\.rb$}) { "spec" }
+    watch(%r{^app/(.+)\.rb$}) { "spec" }
+  end
+
+  guard :bundler do
+    require "guard/bundler"
+    require "guard/bundler/verify"
+    helper = Guard::Bundler::Verify.new
+
+    files = ["Gemfile"]
+    files += Dir["*.gemspec"] if files.any? { |f| helper.uses_gemspec?(f) }
+
+    # Assume files are symlinked from somewhere
+    files.each { |file| watch(helper.real_path(file)) }
+  end
+end
+
+guard :standardrb, fix: true, all_on_start: true, progress: true do
+  watch(/.+\.rb$/)
+end
+GUARDFILE
+File.write "Guardfile", guardfile
+
+puts "Preparing RSpec"
+rspec_rake = <<~RAKEFILE
+require "rspec/core"
+require "rspec/core/rake_task"
+
+desc "Run all specs in spec directory (excluding plugin specs)"
+RSpec::Core::RakeTask.new(spec: "app:db:test:prepare")
+
+task default: :spec
+RAKEFILE
+
+rakefile = File.read "Rakefile"
+File.write "Rakefile", "#{rakefile}\n#{rspec_rake}"
+
+cmd = "bin/rails g rspec:install"
+puts cmd
+system cmd
+
+File.write ".rspec", "--require spec_helper --format documentation"
+
+rspec_require = <<~REQUIRE
+require_relative "test_app/config/environment"
+require_relative "../lib/#{c8o_name}"
+REQUIRE
+
+rails_helper = File.read "spec/rails_helper.rb"
+rails_helper = rails_helper.gsub("require_relative '../config/environment'", rspec_require)
+File.write "spec/rails_helper.rb", rails_helper
+
+FileUtils.remove_dir "test"
+
+puts "Preparing test app"
+FileUtils.cd "spec/test_app"
+cmd = "bin/rails active_storage:install && bin/rails action_text:install"
+puts cmd
+system cmd
+FileUtils.cd "../.."
+cmd = "bin/rails db:create db:migrate db:test:prepare"
+puts cmd
+system cmd
+
+puts "Testing..."
+cmd = "bin/rails spec"
+puts cmd
+system cmd
+
+puts "Committing"
+cmd = "git add . && git commit -am 'First commit of #{module_name}'"
+puts cmd
+system cmd
+
+# puts "Starting devcontainer"
+# FileUtils.cd ".."
+# cmd = "devpod up #{c8o_name}"
+# system cmd
+
+puts "...done"
+
+
+
